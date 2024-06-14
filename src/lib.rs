@@ -110,11 +110,14 @@
 //! #         e: e.to_string(),
 //! #     };
 //!
-//!     let mut az_auth = AzureAuth::new("6e74172b-be56-4843-9ff4-e66a39bb12e3").unwrap();
+//! # tokio_test::block_on(async {
+//!     let client = reqwest::Client::new();
+//!     let mut az_auth = AzureAuth::new("6e74172b-be56-4843-9ff4-e66a39bb12e3", client.clone()).await.unwrap();
 //! #     az_auth.set_public_keys(vec![key]);
 //!
-//!     let decoded_token = az_auth.validate_token(&token).expect("validated");
+//!     let decoded_token = az_auth.validate_token(&token, client).await.expect("validated");
 //!     assert_eq!(decoded_token.claims.preferred_username, Some("abeli@microsoft.com".to_string()));
+//! # })
 //! ```
 //!
 //! # Example in webserver
@@ -141,7 +144,7 @@
 use chrono::{Duration, Local, NaiveDateTime};
 use jsonwebtoken as jwt;
 use jwt::DecodingKey;
-use reqwest::{self, blocking::Response};
+use reqwest;
 use serde::{Deserialize, Serialize};
 
 mod error;
@@ -193,10 +196,10 @@ impl AzureAuth {
     /// # Errors
     ///
     /// If there is a connection issue to the Microsoft APIs.
-    pub fn new(aud: impl Into<String>) -> Result<Self, AuthErr> {
+    pub async fn new(aud: impl Into<String>, client: reqwest::Client) -> Result<Self, AuthErr> {
         Ok(AzureAuth {
             aud_to_val: aud.into(),
-            jwks_uri: AzureAuth::get_jwks_uri()?,
+            jwks_uri: AzureAuth::get_jwks_uri(client).await?,
             public_keys: None,
             last_refresh: None,
             exp_hours: 24,
@@ -222,15 +225,17 @@ impl AzureAuth {
     }
 
     /// Dafault validation, see `AzureAuth` documentation for the defaults.
-    pub fn validate_token(&mut self, token: &str) -> Result<Token<AzureJwtClaims>, AuthErr> {
+    pub async fn validate_token<'a>(
+        &mut self,
+        token: &str,
+        client: reqwest::Client,
+    ) -> Result<Token<AzureJwtClaims>, AuthErr> {
         let mut validator = jwt::Validation::new(jwt::Algorithm::RS256);
 
         // exp, nbf, iat is set to validate as default
         validator.leeway = 60;
         validator.set_audience(&[&self.aud_to_val]);
-        let decoded: Token<AzureJwtClaims> = self.validate_token_authenticity(token, &validator)?;
-
-        Ok(decoded)
+        self.validate_custom(token, &validator, client).await
     }
 
     /// Allows for a custom validator and mapping the token to your own type.
@@ -262,29 +267,53 @@ impl AzureAuth {
     /// let valid_token: Token<MyClaims>  = auth.validate_custom(some_token, &validator).unwrap();
     /// ```
     ///
-    pub fn validate_custom<T>(
+    pub async fn validate_custom<'a, T>(
         &mut self,
         token: &str,
         validator: &jwt::Validation,
+        client: reqwest::Client,
     ) -> Result<Token<T>, AuthErr>
     where
         for<'de> T: Serialize + Deserialize<'de>,
     {
-        let decoded: Token<T> = self.validate_token_authenticity(token, &validator)?;
+        let result = self
+            .validate_token_authenticity(token, &validator, client.clone())
+            .await;
+        let decoded = match result {
+            Err(e) => {
+                // the first time this happens let's go and refresh the keys and try once more.
+                // It could be that our keys are out of date. Limit to once in an hour.
+                if self.should_retry() {
+                    self.refresh_pub_keys(client.clone()).await?;
+                    self.retry_counter += 1;
+                    self.validate_token_authenticity(token, &validator, client)
+                        .await?
+                } else {
+                    self.retry_counter = 0;
+                    return Err(e);
+                }
+            }
+            Ok(value) => {
+                self.retry_counter = 0;
+                value
+            }
+        };
+
         Ok(decoded)
     }
 
-    fn validate_token_authenticity<T>(
+    async fn validate_token_authenticity<'a, T>(
         &mut self,
         token: &str,
         validator: &jwt::Validation,
+        client: reqwest::Client,
     ) -> Result<Token<T>, AuthErr>
     where
         for<'de> T: Serialize + Deserialize<'de>,
     {
         // if we´re in offline, we never refresh the keys. It's up to the user to do that.
         if !self.is_keys_valid() && !self.is_offline {
-            self.refresh_pub_keys()?;
+            self.refresh_pub_keys(client.clone()).await?;
         }
         // does not validate the token!
         let decoded = jwt::decode_header(token)?;
@@ -297,28 +326,9 @@ impl AzureAuth {
             },
         };
 
-        let auth_key = match key {
-            None => {
-                // the first time this happens let's go and refresh the keys and try once more.
-                // It could be that our keys are out of date. Limit to once in an hour.
-                if self.should_retry() {
-                    self.refresh_pub_keys()?;
-                    self.retry_counter += 1;
-                    self.validate_token(token)?;
-                    unreachable!()
-                } else {
-                    self.retry_counter = 0;
-                    return Err(AuthErr::Other(
-                        "Invalid token. Could not verify authenticity.".into(),
-                    ));
-                }
-            }
-            Some(key) => {
-                self.retry_counter = 0;
-                key
-            }
-        };
-
+        let auth_key = key.ok_or(AuthErr::Other(
+            "Invalid token. Could not verify authenticity.".into(),
+        ))?;
         let key = DecodingKey::from_rsa_components(auth_key.modulus(), auth_key.exponent());
         let valid: Token<T> = jwt::decode(token, &key, &validator)?;
 
@@ -355,9 +365,9 @@ impl AzureAuth {
         }
     }
 
-    fn refresh_pub_keys(&mut self) -> Result<(), AuthErr> {
-        let resp: Response = reqwest::blocking::get(&self.jwks_uri)?;
-        let resp: JwkSet = resp.json()?;
+    async fn refresh_pub_keys(&mut self, client: reqwest::Client) -> Result<(), AuthErr> {
+        let resp = client.get(&self.jwks_uri).send().await?;
+        let resp: JwkSet = resp.json().await?;
         self.last_refresh = Some(Local::now().naive_local());
         self.public_keys = Some(resp.keys);
         Ok(())
@@ -367,14 +377,14 @@ impl AzureAuth {
     /// document. See: https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
     /// Usually, this is not needed but for some cases you might want to try
     /// to fetch a new uri on receiving an error.
-    pub fn refresh_rwks_uri(&mut self) -> Result<(), AuthErr> {
-        self.jwks_uri = AzureAuth::get_jwks_uri()?;
+    pub async fn refresh_rwks_uri(&mut self, client: reqwest::Client) -> Result<(), AuthErr> {
+        self.jwks_uri = AzureAuth::get_jwks_uri(client).await?;
         Ok(())
     }
 
-    fn get_jwks_uri() -> Result<String, AuthErr> {
-        let resp: Response = reqwest::blocking::get(AZ_OPENID_URL)?;
-        let resp: OpenIdResponse = resp.json()?;
+    async fn get_jwks_uri(client: reqwest::Client) -> Result<String, AuthErr> {
+        let resp = client.get(AZ_OPENID_URL).send().await?;
+        let resp: OpenIdResponse = resp.json().await?;
 
         Ok(resp.jwks_uri)
     }
@@ -673,8 +683,8 @@ xMd+OWT6JsInVM1ASh1mcn+Q0/Z3WqxxetCQLqaMs+FATn059dGf";
         complete_token
     }
 
-    #[test]
-    fn decode_token() {
+    #[tokio::test]
+    async fn decode_token() {
         let token = generate_test_token();
 
         // we need to construct our own key object that matches on `kid` field
@@ -692,31 +702,38 @@ xMd+OWT6JsInVM1ASh1mcn+Q0/Z3WqxxetCQLqaMs+FATn059dGf";
         let mut az_auth =
             AzureAuth::new_offline("6e74172b-be56-4843-9ff4-e66a39bb12e3", vec![key]).unwrap();
 
-        az_auth.validate_token(&token).unwrap();
+        let client = reqwest::Client::new();
+        az_auth.validate_token(&token, client).await.unwrap();
     }
 
     // TODO: we need a test for the retry operation.
 
-    #[test]
-    fn refresh_rwks_uri() {
-        let _az_auth = AzureAuth::new("app_secret").unwrap();
+    #[tokio::test]
+    async fn refresh_rwks_uri() {
+        let _az_auth = AzureAuth::new("app_secret", reqwest::Client::new())
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn azure_ad_get_public_keys() {
-        let mut az_auth = AzureAuth::new("app_secret").unwrap();
-        az_auth.refresh_pub_keys().unwrap();
+    #[tokio::test]
+    async fn azure_ad_get_public_keys() {
+        let client = reqwest::Client::new();
+        let mut az_auth = AzureAuth::new("app_secret", client.clone()).await.unwrap();
+        az_auth.refresh_pub_keys(client).await.unwrap();
     }
 
-    #[test]
-    fn azure_ad_get_refresh_rwks_uri() {
-        let mut az_auth = AzureAuth::new("app_secret").unwrap();
-        az_auth.refresh_rwks_uri().unwrap();
+    #[tokio::test]
+    async fn azure_ad_get_refresh_rwks_uri() {
+        let client = reqwest::Client::new();
+        let mut az_auth = AzureAuth::new("app_secret", client.clone()).await.unwrap();
+        az_auth.refresh_rwks_uri(client).await.unwrap();
     }
 
-    #[test]
-    fn is_not_valid_more_than_24h() {
-        let mut az_auth = AzureAuth::new("app_secret").unwrap();
+    #[tokio::test]
+    async fn is_not_valid_more_than_24h() {
+        let mut az_auth = AzureAuth::new("app_secret", reqwest::Client::new())
+            .await
+            .unwrap();
         az_auth.last_refresh = Some(Local::now().naive_local() - Duration::hours(25));
 
         assert!(!az_auth.is_keys_valid());

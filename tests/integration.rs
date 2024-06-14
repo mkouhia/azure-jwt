@@ -97,8 +97,8 @@ fn generate_test_token() -> String {
     complete_token
 }
 
-#[test]
-fn decode_token() {
+#[tokio::test]
+async fn decode_token() {
     let token = generate_test_token();
     // we need to construct our own key object that matches on `kid` field
     // just as it should if we used the fetched keys from microsofts servers.
@@ -108,9 +108,15 @@ fn decode_token() {
         e: PUBLIC_KEY_E.to_string(),
     };
 
-    let mut az_auth = AzureAuth::new("6e74172b-be56-4843-9ff4-e66a39bb12e3").unwrap();
+    let client = reqwest::Client::new();
+    let mut az_auth = AzureAuth::new("6e74172b-be56-4843-9ff4-e66a39bb12e3", client.clone())
+        .await
+        .unwrap();
     // We manually overwrite the keys so we use the ones we have for testing
     az_auth.set_public_keys(vec![key]);
 
-    az_auth.validate_token(&token).expect("validated");
+    az_auth
+        .validate_token(&token, client)
+        .await
+        .expect("validated");
 }
